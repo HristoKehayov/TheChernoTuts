@@ -1,0 +1,3 @@
+$(SolutionDir)bin\$(ProjectName)\$(Platform)\$(Configuration)\
+
+$(SolutionDir)bin\$(ProjectName)\intermediates\$(Platform)\$(Configuration)\
