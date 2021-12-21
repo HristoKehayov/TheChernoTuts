@@ -1,62 +1,256 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# works with a file called VERSION in the current directory,
-# the contents of which should be a semantic version number
-# such as "1.2.3"
+set -e
 
-# this script will display the current version, automatically
-# suggest a "minor" version update, and ask for input to use
-# the suggestion, or a newly entered value.
+# Initializes flags and other variables
 
-# once the new version number is determined, the script will
-# pull a list of changes from git history, prepend this to
-# a file called CHANGES (under the title of the new version
-# number) and create a GIT tag.
+action=''           # the sub-command to execute
+dry=false           # Flag to run with executing commands
+force=false         # Flag to run without asking for confirmation
+versionFile=true   # Flag to generate the .semver file
+last=''             # Will contain the last version tag found
 
-if [ -f VERSION ]; then
-    BASE_STRING=`cat VERSION`
-    BASE_LIST=(`echo $BASE_STRING | tr '.' ' '`)
-    V_MAJOR=${BASE_LIST[0]}
-    V_MINOR=${BASE_LIST[1]}
-    V_PATCH=${BASE_LIST[2]}
-    echo "Current version : $BASE_STRING"
-    V_MINOR=$((V_MINOR + 1))
-    V_PATCH=0
-    SUGGESTED_VERSION="$V_MAJOR.$V_MINOR.$V_PATCH"
-    read -p "Enter a version number [$SUGGESTED_VERSION]: " INPUT_STRING
-    if [ "$INPUT_STRING" = "" ]; then
-        INPUT_STRING=$SUGGESTED_VERSION
-    fi
-    echo "Will set new version to be $INPUT_STRING"
-    echo $INPUT_STRING > VERSION
-    echo "Version $INPUT_STRING:" > tmpfile
-    git log --pretty=format:" - %s" "v$BASE_STRING"...HEAD >> tmpfile
-    echo "" >> tmpfile
-    echo "" >> tmpfile
-    cat CHANGES >> tmpfile
-    mv tmpfile CHANGES
-    git add CHANGES VERSION
-    git commit -m "Version bump to $INPUT_STRING"
-    git tag -a -m "Tagging version $INPUT_STRING" "v$INPUT_STRING"
-    git push origin --tags
-else
-    echo "Could not find a VERSION file"
-    read -p "Do you want to create a version file and start from scratch? [y]" RESPONSE
-    if [ "$RESPONSE" = "" ]; then RESPONSE="y"; fi
-    if [ "$RESPONSE" = "Y" ]; then RESPONSE="y"; fi
-    if [ "$RESPONSE" = "Yes" ]; then RESPONSE="y"; fi
-    if [ "$RESPONSE" = "yes" ]; then RESPONSE="y"; fi
-    if [ "$RESPONSE" = "YES" ]; then RESPONSE="y"; fi
-    if [ "$RESPONSE" = "y" ]; then
-        echo "0.1.0" > VERSION
-        echo "Version 0.1.0" > CHANGES
-        git log --pretty=format:" - %s" >> CHANGES
-        echo "" >> CHANGES
-        echo "" >> CHANGES
-        git add VERSION CHANGES
-        git commit -m "Added VERSION and CHANGES files, Version bump to v0.1.0"
-        git tag -a -m "Tagging version 0.1.0" "v0.1.0"
-        git push origin --tags
+## Runs a command with arguments, taking care of the --dry flag
+function execute {
+    cmd=("$@")
+    if [[ true == "$dry" ]];then
+        printf '%s \n' "DRY -no changes- ${cmd[*]}"
+        return
     fi
 
+    printf '%s\n' "Executing ${cmd[*]} ..."
+
+    "${cmd[@]}" 2>&1
+}
+
+# Asks for confirmation returns yes|no
+function confirm() {
+    read -p "$1 ([y]es or [N]o): "
+    case $(echo $REPLY | tr '[A-Z]' '[a-z]') in
+        y|yes) echo "yes" ;;
+        *)     echo "no" ;;
+    esac
+}
+
+# Generates the .semver file
+function updateSemverFile() {
+    if [[ true == "$dry" || false == "$versionFile" ]]; then
+        return 0
+    fi
+    
+    :> .semver
+    exec 3<> .semver
+
+    echo "---" >&3
+    echo ":major: $major" >&3
+    echo ":minor: $minor" >&3
+    echo ":patch: $patch" >&3
+    echo >&3
+    
+    echo ":notes: $msg" >&3
+    echo >&3
+    exec 3>&-
+}
+
+function pushSemver() {
+    execute git add .semver
+    execute git commit -m "Update .semver file"
+    execute git push
+}
+
+# Removes last tag both local and remote
+function removeTag() {
+    execute git tag -d "$last"
+    execute git push origin :"$last"
+    updateSemverFile
+}
+
+# Reset tags to remote by removing locals tags
+function resetTag() {
+    execute git tag -l | xargs
+    git tag -d
+    execute git fetch --tags
+    updateSemverFile
+}
+
+# Shows full help for the script
+
+function showHelp() {
+cat <<'TXT'
+versiontag
+==========
+
+Automates version tag creation.
+
+Commands:   major|minor|patch 'Tag message'
+            remove
+            current
+
+Options:    -d|--dry:     don't change things
+            -f|--force:   don't ask for confirmation
+            -h|--help:    show this help
+            -m|--message: annotate tag with a message
+            -s|--semver:  generate .semver file
+
+Examples:
+---------
+
+Show current version:  versiontag current
+Patch version:         versiontag patch 'Fix broken view'
+Minor version:         versiontag minor --message'Add Customer filter by email'
+Major version:         versiontag major -m 'Blog module'
+Remove last version:   versiontag remove
+Run without changes:   versiontag --dry remove
+
+TXT
+}
+
+# Shows the result of the command
+
+function showSuccess() {
+    echo
+    echo "Tag v$major.$minor.$patch was created in local repository."
+    echo
+    echo "Push it:"
+    echo
+    echo "    git push origin v$major.$minor.$patch"
+    echo
+    echo "Delete tag:"
+    echo
+    echo "    git tag -d v$major.$minor.$patch"
+    echo
+}
+
+# Show current version
+
+function showCurrentVersion() {
+    if [[ true == "$versionFile" ]]; then
+        updateSemverFile
+        printf '.semver file generated for: %s\n' "$last"
+        return
+    fi
+    printf 'Current version: %s\n' "$last"
+}
+
+# Get the last tag and breaks into parts
+
+function getLastTag() {
+    lasttag=`git tag -l --sort=-committerdate | head -1 2> /dev/null` || true
+
+    if [[ -z "$lasttag" ]]; then
+        lasttag='v0.0.0'
+    fi
+
+    lasttag=${lasttag:1}
+
+    parts=(${lasttag//./ })
+
+    major=${parts[0]}
+    minor=${parts[1]}
+    patch=${parts[2]}
+
+    last="v$major.$minor.$patch"
+}
+
+# Get last tag from repo and process the desired command
+
+getLastTag
+
+# Process command options
+
+for ((i = 1; i <= $#; i++ )); do
+    case ${!i} in
+        "-d"|"--dry")
+            dry=true
+            ;;
+        "-f"|"--force")
+            force=true
+            ;;
+        "-h"|"--help")
+            showHelp
+            exit 0
+            ;;
+        "-m"|"--message")
+            let i++
+            msg="${!i}"
+            ;;
+        "-s"|"--semver")
+            versionFile=true
+            ;;
+        "patch"|"minor"|"major")
+            action="${!i}"
+            ;;
+        "current")
+            action='current'
+            ;;
+        "remove")
+            if [[ "yes" == $(confirm "Do you want to remove $last?") ]]; then
+                removeTag
+            fi
+            exit 0
+            ;;
+        "resettags")
+            if [[ "yes" == $(confirm "Do you want to reset tags to remote?") ]]; then
+                resetTag
+            fi
+            exit 0
+            ;;
+        "help")
+            showHelp
+            exit 0
+            ;;
+        *)
+            echo "${!i} option is not valid"
+            exit 1
+            ;;
+    esac
+done
+
+case "$action" in
+    'current')
+        showCurrentVersion
+        exit 0;;
+    'patch')
+        patch=$((patch + 1))
+        ;;
+    'minor')
+        minor=$((minor + 1))
+        patch=0
+        ;;
+    'major')
+        major=$((major + 1))
+        minor=0
+        patch=0
+        ;;
+    *)
+        echo "No mode selected"
+        exit 0
+esac
+
+# Shows information
+
+printf "Current version : %s\n" "$last"
+printf "New tag         : %s.%s.%s\n\n" "v$major" "$minor" "$patch"
+
+if [[ false == "$force" &&  "no" == $(confirm "Do you agree?") ]]; then
+    printf '\n%s' "No tag was created"
+    exit 0;
 fi
+
+if [[ -z $msg ]]; then
+    execute git tag "v$major.$minor.$patch"
+else
+    printf 'Message         : %s\n\n' "$msg"
+    execute git tag -a "v$major.$minor.$patch" -m "$msg ($action version)"
+fi
+
+updateSemverFile
+
+if [[ false == "$force" &&  "no" == $(confirm "Do you want to push this tag right now?") ]]; then
+    printf '\n%s' "No tag was pushed"
+    exit 0;
+fi
+
+execute git push origin "v$major.$minor.$patch"
+
+exit 0
